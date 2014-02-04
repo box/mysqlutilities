@@ -1,0 +1,161 @@
+--- percona-toolkit-2.1.1/bin/pt-kill	2012-04-03 12:51:38.000000000 -0700
++++ box-pt-kill	2014-01-31 13:20:42.550011993 -0800
+@@ -2165,6 +2165,7 @@
+    QUERY:
+    foreach my $query ( @$proclist ) {
+       PTDEBUG && _d('Checking query', Dumper($query));
++      my @property_list = qw(Id User Host db State Command Info);
+       my $matched = 0;
+ 
+       if (    !$find_spec{replication_threads}
+@@ -2188,11 +2189,13 @@
+             next QUERY;
+          }
+          PTDEBUG && _d('Exceeds idle time');
++         # skip Info match for idle queries! They never have one.
++         @property_list = qw(Id User Host db State Command);
+          $matched++;
+       }
+- 
++
+       PROPERTY:
+-      foreach my $property ( qw(Id User Host db State Command Info) ) {
++      foreach my $property ( @property_list ) {
+          my $filter = "_find_match_$property";
+          if ( defined $find_spec{ignore}->{$property}
+               && $self->$filter($query, $find_spec{ignore}->{$property}) ) {
+@@ -3739,6 +3742,7 @@
+       $SIG{CHLD} = 'IGNORE';
+    }
+ 
++   my $max_connections =  $o->get('max-connections') ? $o->get('max-connections') : get_max_connections($dbh);
+    while ( (!$run_time || $now < $end) && !-f $sentinel ) {
+       msg('Checking processlist');
+       my $proclist;
+@@ -3748,6 +3752,11 @@
+          die "Error getting SHOW PROCESSLIST: $EVAL_ERROR";
+       }
+ 
++      if ($o->get('dynamic-time')) {
++        my $thread_count = scalar(@$proclist);
++        adjust_time_in_find_spec(\%find_spec, $thread_count, $max_connections);
++      }
++
+       # Apply --filter to the processlist events.
+       my $filtered_proclist;
+       if ( $filter_sub && $proclist && @$proclist ) {
+@@ -3846,9 +3855,10 @@
+          MATCHING_QUERY:
+          foreach my $query ( @queries ) {
+             if ( $o->get('print') ) {
+-               printf "# %s %s %d (%s %d sec) %s\n",
++               printf "# %s %s %d (%s %d sec) (\'%s\'@\'%s\') %s\n",
+                   ts(time), $o->get('kill-query') ? 'KILL QUERY' : 'KILL',
+                   $query->{Id}, ($query->{Command} || 'NULL'), $query->{Time},
++                  ($query->{User} || 'NULL'), ($query->{Host} || 'NULL'),
+                   ($query->{Info} || 'NULL');
+             }
+             if ( $o->get('execute-command') ) {
+@@ -3900,6 +3910,53 @@
+ # Subroutines.
+ # ############################################################################
+ 
++sub get_max_connections {
++  my ($dbh) = @_;
++
++  my ($name, $value) = $dbh->selectrow_array("SHOW GLOBAL VARIABLES LIKE 'max_connections'");
++  return $value;
++}
++
++sub adjust_time_in_find_spec {
++  my ($spec, $threads_connected, $max_connections) = @_;
++
++  my $percent = max(0, ($max_connections-$threads_connected) / $max_connections);
++  msg("Found $threads_connected out of $max_connections: ($percent)");
++
++  if ($percent*100 >= $o->get('dynamic-time')) {
++    # free connections are higher than our threshold, don't enforce yet
++    if ($o->get('busy-time')) { 
++       $o->set('interval', max(1, $o->get('busy-time')  / 2))
++         unless $o->got('interval');
++	   $spec->{'busy_time'} = $o->get('busy-time');
++    }
++
++    if ($o->get('idle-time')) {
++	   $spec->{'idle_time'} = $o->get('idle-time');
++    }
++    return $spec;
++  }
++
++  if ($o->get('busy-time')) {
++    my $new_busy_time = max($o->get('min-busy-time'),int($o->get('busy-time')*$percent));
++
++    $o->set('interval', max(1, $new_busy_time / 2))
++         unless $o->got('interval');
++
++    $spec->{'busy_time'} = $new_busy_time; 
++    msg("Adjusted busy-time. $threads_connected/$max_connections; Percent is ".($percent*100).", old busy-time: ". $o->get('busy-time')."; new: $new_busy_time");
++  } else {
++
++ }
++
++  if ($o->get('idle-time')) {
++    my $new_idle_time = max($o->get('min-idle-time'), int($o->get('idle-time')*$percent));
++    $spec->{'idle_time'} = $new_idle_time; 
++    msg("Adjusted idle-time. $threads_connected/$max_connections; Percent is ".($percent*100).", old idle-time: ". $o->get('idle-time')."; new: $new_idle_time");
++  }
++  return;
++}
++
+ sub get_cxn {
+    my ( $dp, $dsn, $ac ) = @_;
+    if ( $o->get('ask-pass') ) {
+@@ -4326,6 +4383,40 @@
+ 
+ Remove SQL comments from queries in the Info column of the PROCESSLIST.
+ 
++=item --dynamic-time
++
++type: int; default: 0
++
++Dynamically adjust the l<"--busy-time"> and/or L<"--idle-time"> variables as a
++function of the ration of Threads_connected to Max_connection.  This allows
++pt-kill to be more aggressive as mysql nears its connectin limit.  The value
++is the maximum number of available connections at which to start applying the
++dynamic setting.  For example, --dynamic-time=60 means that busy-time will
++only be adjusted when (max_connections - threads_connected)/max_connections
++becomes less than or equal to 0.60, meaning 60% of connections are free,
++but 40% have been used.
++
++=item --min-busy-time
++
++type: int; default: 0
++
++When using L<"--dynamic-time"> use this as the lowest possible value pt-kill
++will use for L<"--busy-time">.
++
++=item --min-idle-time
++
++type: int; default: 0
++
++When using L<"--dynamic-time"> use this as the lowest possible value pt-kill
++will use for L<"--idle-time">
++
++=item --max-connections
++
++type: int
++
++When using L<"--dynamic-time"> use this as the value for the server's connection
++limit instead of the server's max_connections variable.
++
+ =item --user
+ 
+ short form: -u; type: string
+@@ -4857,6 +4948,6 @@
+ 
+ =head1 VERSION
+ 
+-pt-kill 2.1.1
++pt-kill 2.1.1 (box)
+ 
+ =cut
