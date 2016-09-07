@@ -1,5 +1,5 @@
---- percona-toolkit-2.1.1/bin/pt-kill	2012-04-03 12:51:38.000000000 -0700
-+++ box-pt-kill	2014-01-31 13:20:42.550011993 -0800
+--- percona-toolkit-2.1.1/bin/pt-kill  2012-04-03 12:51:38.000000000 -0700
++++ box-pt-kill        2016-09-06 15:26:19.38.000000000 -0800
 @@ -2165,6 +2165,7 @@
     QUERY:
     foreach my $query ( @$proclist ) {
@@ -24,27 +24,56 @@
           my $filter = "_find_match_$property";
           if ( defined $find_spec{ignore}->{$property}
                && $self->$filter($query, $find_spec{ignore}->{$property}) ) {
-@@ -3739,6 +3742,7 @@
+@@ -3685,6 +3688,9 @@
+    my $each_busy_time = $o->get('each-busy-time');
+    my $any_busy_time  = $o->get('any-busy-time');
+    my $group_by       = $o->get('group-by');
++   if ($o->get('dynamic-user-time')) {
++     $group_by = 'user';
++   }
+    if ( $group_by
+         && $group_by =~ m/id|user|host|db|command|time|state|info/i ) {
+       # Processlist.pm is case-sensitive.  It matches Id, Host, db, etc.
+@@ -3739,6 +3745,8 @@
        $SIG{CHLD} = 'IGNORE';
     }
  
 +   my $max_connections =  $o->get('max-connections') ? $o->get('max-connections') : get_max_connections($dbh);
++   my $max_user_connections =  $o->get('max-connections') ? $o->get('max-connections') : get_max_user_connections($dbh);
     while ( (!$run_time || $now < $end) && !-f $sentinel ) {
        msg('Checking processlist');
        my $proclist;
-@@ -3748,6 +3752,11 @@
+@@ -3748,6 +3756,13 @@
           die "Error getting SHOW PROCESSLIST: $EVAL_ERROR";
        }
  
++      my $using_dynamic_time_adjustment = 0;
 +      if ($o->get('dynamic-time')) {
 +        my $thread_count = scalar(@$proclist);
-+        adjust_time_in_find_spec(\%find_spec, $thread_count, $max_connections);
++        $using_dynamic_time_adjustment =
++          adjust_time_in_find_spec(\%find_spec, $thread_count, $max_connections);
 +      }
 +
        # Apply --filter to the processlist events.
        my $filtered_proclist;
        if ( $filter_sub && $proclist && @$proclist ) {
-@@ -3846,9 +3855,10 @@
+@@ -3779,7 +3794,14 @@
+          foreach my $class ( keys %$query_classes ) {
+             PTDEBUG && _d('Finding matching queries in class', $class);
+
+-            my @matches = $pl->find($query_classes->{$class}, %find_spec);
++            my $class_processlist = $query_classes->{$class};
++            my %class_find_spec = %find_spec;
++            if ($o->get('dynamic-user-time')) {
++              my $user_thread_count = scalar(@$class_processlist);
++              $using_dynamic_time_adjustment +=
++                adjust_time_in_find_spec(\%class_find_spec, $user_thread_count, $max_user_connections, $class);
++            }
++            my @matches = $pl->find($class_processlist, %class_find_spec);
+             PTDEBUG && _d(scalar @matches, 'queries in class', $class);
+             next CLASS unless scalar @matches;
+
+@@ -3846,12 +3868,13 @@
           MATCHING_QUERY:
           foreach my $query ( @queries ) {
              if ( $o->get('print') ) {
@@ -55,8 +84,12 @@
 +                  ($query->{User} || 'NULL'), ($query->{Host} || 'NULL'),
                    ($query->{Info} || 'NULL');
              }
-             if ( $o->get('execute-command') ) {
-@@ -3900,6 +3910,53 @@
+-            if ( $o->get('execute-command') ) {
++            if ( $o->get('execute-command') && !$using_dynamic_time_adjustment) {
+                exec_cmd($o->get('execute-command'));
+                msg('Executed ' . $o->get('execute-command'));
+             }
+@@ -3900,6 +3923,84 @@
  # Subroutines.
  # ############################################################################
  
@@ -67,50 +100,90 @@
 +  return $value;
 +}
 +
++sub get_max_user_connections {
++  my ($dbh) = @_;
++
++  my ($name, $value) = $dbh->selectrow_array("SHOW GLOBAL VARIABLES LIKE 'max_user_connections'");
++  return $value;
++}
++
 +sub adjust_time_in_find_spec {
-+  my ($spec, $threads_connected, $max_connections) = @_;
++  my ($spec, $threads_connected, $max_connections, $group) = @_;
++
++  my $user_type = 'any';
++  my $dynamic_time = $o->get('dynamic-time');
++  my $default_busy = $o->get('busy-time');
++  my $default_idle = $o->get('idle-time');
++  my $old_busy = $spec->{'busy_time'};
++  my $old_idle = $spec->{'idle_time'};
++  my $ret = 9;
++
++  if ($group) {
++    $user_type = $group;
++    $dynamic_time = $o->get('dynamic-user-time');
++  }
 +
 +  my $percent = max(0, ($max_connections-$threads_connected) / $max_connections);
-+  msg("Found $threads_connected out of $max_connections: ($percent)");
++  msg("Found $threads_connected out of $max_connections for user $user_type: ($percent)");
 +
-+  if ($percent*100 >= $o->get('dynamic-time')) {
++  if ($percent*100 >= $dynamic_time) {
 +    # free connections are higher than our threshold, don't enforce yet
-+    if ($o->get('busy-time')) { 
-+       $o->set('interval', max(1, $o->get('busy-time')  / 2))
-+         unless $o->got('interval');
-+	   $spec->{'busy_time'} = $o->get('busy-time');
-+    }
++     if (!$group) {
++      if ($default_busy) {
++        $o->set('interval', max(1, $default_busy  / 2))
++          unless $o->got('interval');
++        $spec->{'busy_time'} = $default_busy;
++      }
 +
-+    if ($o->get('idle-time')) {
-+	   $spec->{'idle_time'} = $o->get('idle-time');
++      if ($default_idle) {
++        $spec->{'idle_time'} = $default_idle;
++      }
 +    }
-+    return $spec;
++    return $ret;
 +  }
 +
-+  if ($o->get('busy-time')) {
-+    my $new_busy_time = max($o->get('min-busy-time'),int($o->get('busy-time')*$percent));
++  if ($default_busy) {
++    my $new_busy_time = max($o->get('min-busy-time'),int($default_busy*$percent));
++    if (!$group) {
++      $o->set('interval', max(1, $new_busy_time / 2))
++        unless $o->got('interval');
++    }
 +
-+    $o->set('interval', max(1, $new_busy_time / 2))
-+         unless $o->got('interval');
-+
-+    $spec->{'busy_time'} = $new_busy_time; 
-+    msg("Adjusted busy-time. $threads_connected/$max_connections; Percent is ".($percent*100).", old busy-time: ". $o->get('busy-time')."; new: $new_busy_time");
-+  } else {
-+
-+ }
-+
-+  if ($o->get('idle-time')) {
-+    my $new_idle_time = max($o->get('min-idle-time'), int($o->get('idle-time')*$percent));
-+    $spec->{'idle_time'} = $new_idle_time; 
-+    msg("Adjusted idle-time. $threads_connected/$max_connections; Percent is ".($percent*100).", old idle-time: ". $o->get('idle-time')."; new: $new_idle_time");
++    if ($new_busy_time > $old_busy && $group) {
++      msg("Calculated new busy-time $new_busy_time for user $user_type is a higher value than previously calculated value $old_busy. Not applying.");
++    } else {
++      $spec->{'busy_time'} = $new_busy_time;
++      msg("Adjusted busy-time for user: $user_type. $threads_connected/$max_connections; Percent is ".($percent*100).", default busy-time: ". $default_busy."; adjusted: $new_busy_time");
++      $ret = 1
++    }
 +  }
-+  return;
++
++  if ($default_idle) {
++    my $new_idle_time = max($o->get('min-idle-time'), int($default_idle*$percent));
++    if ($new_idle_time > $old_idle && $group) {
++      msg("Calculated new idle-time $new_idle_time for user $user_type is a higher value than previously calculated value $old_idle. Not applying.");
++    } else {
++      $spec->{'idle_time'} = $new_idle_time;
++      msg("Adjusted idle-time for user: $user_type. $threads_connected/$max_connections; Percent is ".($percent*100).", default idle-time: ". $default_idle."; adjusted: $new_idle_time");
++      $ret = 1
++    }
++  }
++  return $ret;
 +}
 +
  sub get_cxn {
     my ( $dp, $dsn, $ac ) = @_;
     if ( $o->get('ask-pass') ) {
-@@ -4326,6 +4383,40 @@
+@@ -4133,6 +4234,8 @@
+
+ L<"--daemonize"> and L<"--test-matching"> are mutually exclusive.
+
++L<"--group-by"> and L<"--dynamic-user-time> are mutually exclusive.
++
+ =over
+
+ =item --ask-pass
+@@ -4326,6 +4429,55 @@
  
  Remove SQL comments from queries in the Info column of the PROCESSLIST.
  
@@ -126,6 +199,21 @@
 +only be adjusted when (max_connections - threads_connected)/max_connections
 +becomes less than or equal to 0.60, meaning 60% of connections are free,
 +but 40% have been used.
++
++=item --dynamic-user-time
++
++type: int; default: 0
++
++Similar to --dynamic-time, but on a per-user level.
++Dynamically adjust the l<"--busy-time"> and/or L<"--idle-time"> variables on a
++per-user level as a function of the ration of Threads_connected for a given user
++to the Max_user_connection.  This allows pt-kill to be more aggressive as a user
++nears its connectin limit.  The value is the maximum number of available
++connections at which to start applying the dynamic setting.  For example,
++--dynamic-user-time=60 means that busy-time will only be adjusted when
++(max_user_connections - user_threads_connected)/max_user_connections becomes
++less than or equal to 0.60, meaning 60% of connections are free, but 40% have
++been used.
 +
 +=item --min-busy-time
 +
@@ -151,7 +239,7 @@
  =item --user
  
  short form: -u; type: string
-@@ -4857,6 +4948,6 @@
+@@ -4857,6 +5009,6 @@
  
  =head1 VERSION
  
